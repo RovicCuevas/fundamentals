@@ -1,0 +1,42 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: backend } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm, cache-dependency-path: backend/package-lock.json }
+      - run: npm ci
+      - run: npm test
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: frontend } }
+    env:
+      BACKEND_URL: http://localhost:4000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm, cache-dependency-path: frontend/package-lock.json }
+      - run: npm ci
+      - run: npx next typegen
+      - run: npx tsc --noEmit
+      - run: npx eslint
+      - run: npx next build
+
+  secrets-and-hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: No env files, DB files, or obvious secrets committed
+        run: |
+          if git ls-files | grep -E '(^|/)\.env' | grep -vE '\.example$'; then echo "::error::.env file committed"; exit 1; fi
+          if git ls-files | grep -E '\.(db|db-wal|db-shm|sqlite)$'; then echo "::error::database file committed"; exit 1; fi
+          if git grep -nE '(sk_(test|live)_[A-Za-z0-9]{10,}|whsec_[A-Za-z0-9]{10,}|postgres(ql)?://[^ "'"'"']+:[^ "'"'"']+@)' -- . ':!*.md' ':!*.example'; then echo "::error::possible secret committed"; exit 1; fi
+          if git grep -nE 'payMongoRequest\(ctx,' -- backend/src; then echo "::error::payMongoRequest must receive ctx.config"; exit 1; fi

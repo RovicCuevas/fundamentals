@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+node_modules/
+.next/
+.worktrees/
