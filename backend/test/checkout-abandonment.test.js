@@ -152,6 +152,115 @@ test("booking still returns the created appointment when notification delivery f
   }
 });
 
+test("payment status remains successful when notification delivery fails", async () => {
+  const failing = createApp({
+    dbPath: ":memory:",
+    seedOnStart: true,
+    demoMode: true,
+    jwtSecret: "t".repeat(40),
+    faceDescriptorKey: "a".repeat(64),
+    payMongoSecretKey: "",
+    notificationProvider: async () => {
+      throw new Error("notification provider unavailable");
+    },
+    port: 0,
+  });
+  await new Promise((resolve) => failing.server.listen(0, resolve));
+  const failingBase = `http://localhost:${failing.server.address().port}`;
+  try {
+    const loginResponse = await fetch(`${failingBase}/api/auth/demo-login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ role: "patient" }),
+    });
+    const login = await loginResponse.json();
+    const patient = failing.app.db.prepare(
+      "SELECT p.id AS id, p.user_id AS user_id FROM patients p JOIN users u ON u.id = p.user_id WHERE u.role = 'patient' ORDER BY p.id LIMIT 1",
+    ).get();
+    const dentist = failing.app.db.prepare("SELECT id FROM dentists WHERE active = 1 ORDER BY id LIMIT 1").get();
+    const service = failing.app.db.prepare("SELECT id FROM services WHERE active = 1 ORDER BY id LIMIT 1").get();
+    const appointmentId = Number(failing.app.db.prepare(
+      `INSERT INTO appointments
+       (reference, patient_id, dentist_id, service_id, date, start_time, end_time, status, source)
+       VALUES (?, ?, ?, ?, '2099-02-01', '08:00', '09:00', 'pending', 'online_portal')`,
+    ).run("SC-PAY-NOTIFY", patient.id, dentist.id, service.id).lastInsertRowid);
+    failing.app.db.prepare(
+      `INSERT INTO appointment_payments
+       (appointment_id, provider_checkout_id, checkout_url, amount_centavos, status)
+       VALUES (?, ?, ?, ?, 'paid')`,
+    ).run(appointmentId, "cs_notify_test", "https://example.test/checkout", 40000);
+    failing.app.db.prepare(
+      `INSERT INTO payment_transactions
+       (appointment_id, provider_checkout_id, provider_payment_id, amount_paid_centavos, status)
+       VALUES (?, ?, ?, ?, 'paid')`,
+    ).run(appointmentId, "cs_notify_test", "pay_notify_test", 40000);
+
+    const response = await fetch(`${failingBase}/api/payments/${appointmentId}`, {
+      headers: { Authorization: `Bearer ${login.token}` },
+    });
+    assert.equal(response.status, 200, await response.text());
+  } finally {
+    await failing.close();
+  }
+});
+
+test("paid payment reconciliation sends appointment confirmation", async () => {
+  const app = createApp({
+    dbPath: ":memory:",
+    seedOnStart: true,
+    demoMode: true,
+    jwtSecret: "t".repeat(40),
+    faceDescriptorKey: "a".repeat(64),
+    payMongoSecretKey: "",
+    notificationProvider: () => {},
+    port: 0,
+  });
+  await new Promise((resolve) => app.server.listen(0, resolve));
+  const baseUrl = `http://localhost:${app.server.address().port}`;
+  try {
+    const loginResponse = await fetch(`${baseUrl}/api/auth/demo-login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ role: "patient" }),
+    });
+    const login = await loginResponse.json();
+    const patient = app.app.db.prepare(
+      "SELECT p.id AS id, p.user_id AS user_id FROM patients p JOIN users u ON u.id = p.user_id WHERE u.role = 'patient' ORDER BY p.id LIMIT 1",
+    ).get();
+    const dentist = app.app.db.prepare("SELECT id FROM dentists WHERE active = 1 ORDER BY id LIMIT 1").get();
+    const service = app.app.db.prepare("SELECT id FROM services WHERE active = 1 ORDER BY id LIMIT 1").get();
+    const appointmentId = Number(app.app.db.prepare(
+      `INSERT INTO appointments
+       (reference, patient_id, dentist_id, service_id, date, start_time, end_time, status, source)
+       VALUES (?, ?, ?, ?, '2099-02-02', '09:00', '10:00', 'pending', 'online_portal')`,
+    ).run("SC-PAY-CONFIRM", patient.id, dentist.id, service.id).lastInsertRowid);
+    app.app.db.prepare(
+      `INSERT INTO appointment_payments
+       (appointment_id, provider_checkout_id, checkout_url, amount_centavos, status)
+       VALUES (?, ?, ?, ?, 'pending')`,
+    ).run(appointmentId, "cs_confirmation_test", "https://example.test/checkout", 40000);
+    app.app.db.prepare(
+      `INSERT INTO payment_transactions
+       (appointment_id, provider_checkout_id, provider_payment_id, amount_paid_centavos, status)
+       VALUES (?, ?, ?, ?, 'paid')`,
+    ).run(appointmentId, "cs_confirmation_test", "pay_confirmation_test", 40000);
+
+    const response = await fetch(`${baseUrl}/api/payments/${appointmentId}`, {
+      headers: { Authorization: `Bearer ${login.token}` },
+    });
+    const text = await response.text();
+    assert.equal(response.status, 200, text);
+    const body = JSON.parse(text);
+    assert.equal(body.bookingStatus, "confirmed");
+    const confirmation = app.app.db.prepare(
+      "SELECT status FROM notification_log WHERE appointment_id = ? AND template = 'appointment_confirmed'",
+    ).get(appointmentId);
+    assert.equal(confirmation?.status, "sent");
+  } finally {
+    await app.close();
+  }
+});
+
 test("retrying the same slot releases the patient's orphaned unpaid appointment", async () => {
   const login = await api("POST", "/api/auth/demo-login", { body: { role: "patient" } });
   const token = login.body.token;

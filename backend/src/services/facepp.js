@@ -17,7 +17,12 @@ function safeProviderDetail(value) {
 }
 
 function appendImage(form, field, image) {
-  form.append(field, new Blob([image.data], { type: image.contentType }), `${field}.jpg`);
+  const metadata = image.contentType === "image/png"
+    ? { extension: "png" }
+    : image.contentType === "image/webp"
+      ? { extension: "webp" }
+      : { extension: "jpg" };
+  form.append(field, new Blob([image.data], { type: image.contentType }), `${field}.${metadata.extension}`);
 }
 
 async function request(config, path, form) {

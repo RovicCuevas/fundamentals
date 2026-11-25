@@ -1,7 +1,9 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import * as faceapi from "face-api.js";
 import { deleteIdentityVerification, getIdentityVerification, submitIdentityVerification, type IdentityVerification } from "@/lib/identity-verification";
+import { readJsonResponse } from "@/lib/api-response";
 
 const imageToBase64 = (file: File) =>
   new Promise<{ base64: string; dataUrl: string }>((resolve, reject) => {
@@ -39,6 +41,7 @@ export function IdentityVerificationPanel() {
   const [selfie, setSelfie] = useState("");
   const [idPreview, setIdPreview] = useState("");
   const [selfiePreview, setSelfiePreview] = useState("");
+  const [selfieDescriptor, setSelfieDescriptor] = useState<number[] | null>(null);
   const [consent, setConsent] = useState(false);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -94,6 +97,7 @@ export function IdentityVerificationPanel() {
     file: File | undefined,
     setValue: (value: string) => void,
     setPreview: (value: string) => void,
+    isSelfie = false,
   ) {
     if (!file) return;
     try {
@@ -101,6 +105,26 @@ export function IdentityVerificationPanel() {
       const image = await imageToBase64(file);
       setValue(image.base64);
       setPreview(image.dataUrl);
+      if (isSelfie) {
+        setSelfieDescriptor(null);
+        await Promise.all([
+          faceapi.nets.ssdMobilenetv1.loadFromUri("/models"),
+          faceapi.nets.faceLandmark68Net.loadFromUri("/models"),
+          faceapi.nets.faceRecognitionNet.loadFromUri("/models"),
+        ]);
+        const element = await new Promise<HTMLImageElement>((resolve, reject) => {
+          const loaded = new Image();
+          loaded.onload = () => resolve(loaded);
+          loaded.onerror = () => reject(new Error("Could not load the selfie."));
+          loaded.src = image.dataUrl;
+        });
+        const detection = await faceapi
+          .detectSingleFace(element, new faceapi.SsdMobilenetv1Options({ minConfidence: 0.5 }))
+          .withFaceLandmarks()
+          .withFaceDescriptor();
+        if (!detection) throw new Error("No face detected in the selfie. Choose a clearer selfie.");
+        setSelfieDescriptor(Array.from(detection.descriptor));
+      }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not read the image.");
     }
@@ -125,7 +149,7 @@ export function IdentityVerificationPanel() {
     }
   }
 
-  function captureSelfie() {
+  async function captureSelfie() {
     const video = videoRef.current;
     if (!video || video.videoWidth === 0 || video.videoHeight === 0) {
       setError("The camera is not ready yet. Please wait a moment and try again.");
@@ -143,13 +167,56 @@ export function IdentityVerificationPanel() {
     }
     setSelfie(dataUrl.slice(separator + 1));
     setSelfiePreview(dataUrl);
+    setSelfieDescriptor(null);
     stopCamera();
+    try {
+      await Promise.all([
+        faceapi.nets.ssdMobilenetv1.loadFromUri("/models"),
+        faceapi.nets.faceLandmark68Net.loadFromUri("/models"),
+        faceapi.nets.faceRecognitionNet.loadFromUri("/models"),
+      ]);
+      const detection = await faceapi
+        .detectSingleFace(canvas, new faceapi.SsdMobilenetv1Options({ minConfidence: 0.5 }))
+        .withFaceLandmarks()
+        .withFaceDescriptor();
+      if (!detection) throw new Error("No face detected in the captured selfie.");
+      setSelfieDescriptor(Array.from(detection.descriptor));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not prepare the captured selfie for face login.");
+    }
+  }
+
+  async function enrollVerifiedSelfie(descriptor: number[]) {
+    if (descriptor.length !== 128 || descriptor.some((value) => !Number.isFinite(value))) {
+      throw new Error("A valid 128-float face descriptor could not be created.");
+    }
+    const response = await fetch("/api/auth/face-enroll", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        consent: true,
+        descriptor,
+      }),
+    });
+    const data = await readJsonResponse<{ error?: { message?: string }; message?: string }>(response);
+    if (!response.ok) {
+      throw new Error(data.error?.message ?? data.message ?? "Could not enable face login.");
+    }
+    const statusResponse = await fetch("/api/auth/face-enroll/status", { cache: "no-store" });
+    const status = await readJsonResponse<{ enrolled?: boolean; consentAt?: string | null } & { error?: { message?: string } }>(statusResponse);
+    if (!statusResponse.ok || !status.enrolled) {
+      throw new Error(status.error?.message ?? "Face login enrollment was not persisted.");
+    }
   }
 
   async function submit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!idImage || !selfie) {
       setError("Choose a government ID and capture a selfie.");
+      return;
+    }
+    if (!selfieDescriptor) {
+      setError("A face could not be prepared from your selfie. Choose a clearer selfie and try again.");
       return;
     }
     if (!consent) {
@@ -161,8 +228,24 @@ export function IdentityVerificationPanel() {
     setProgress("Scanning ID...");
     const progressTimer = window.setTimeout(() => setProgress("Comparing faces..."), 1800);
     try {
-      setVerification(await submitIdentityVerification({ idImageBase64: idImage, selfieImageBase64: selfie, consent: true }));
-      setProgress("Verification complete.");
+      const identity = await submitIdentityVerification({ idImageBase64: idImage, selfieImageBase64: selfie, consent: true });
+      if (identity.status !== "verified") {
+        setVerification(identity);
+        throw new Error(identity.failureReason ?? "Identity verification was not successful.");
+      }
+      setProgress("Verification complete. Enabling face login...");
+      try {
+        await enrollVerifiedSelfie(selfieDescriptor);
+      } catch (cause) {
+        setVerification(identity);
+        throw new Error(
+          cause instanceof Error
+            ? `Identity verified, but face login enrollment failed: ${cause.message}`
+            : "Identity verified, but face login enrollment failed.",
+        );
+      }
+      setVerification(identity);
+      setProgress("Identity and face login are ready.");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not submit identity verification.");
       setProgress("");
@@ -181,6 +264,7 @@ export function IdentityVerificationPanel() {
       setSelfie("");
       setIdPreview("");
       setSelfiePreview("");
+      setSelfieDescriptor(null);
       setConsent(false);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not delete verification data.");
@@ -213,7 +297,7 @@ export function IdentityVerificationPanel() {
             </label>
             <label className="text-[12px] font-medium text-heading">
               Selfie
-              <input className="mt-1 block w-full text-[12px] text-muted" type="file" accept="image/jpeg,image/png,image/webp" capture="user" disabled={saving} onChange={(event) => void selectImage(event.target.files?.[0], setSelfie, setSelfiePreview)} />
+              <input className="mt-1 block w-full text-[12px] text-muted" type="file" accept="image/jpeg,image/png,image/webp" capture="user" disabled={saving} onChange={(event) => void selectImage(event.target.files?.[0], setSelfie, setSelfiePreview, true)} />
               {selfiePreview ? <img src={selfiePreview} alt="Selfie preview" className="mt-2 h-24 w-24 rounded border border-divider object-cover" /> : null}
             </label>
           </div>

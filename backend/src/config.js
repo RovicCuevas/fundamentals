@@ -90,6 +90,7 @@ export function loadConfig(overrides = {}) {
       (env.BREVO_API_KEY && (env.BREVO_SENDER_EMAIL || env.NOTIFICATION_FROM_EMAIL) ? "brevo-api" : "console"),
     brevoApiKey: env.BREVO_API_KEY || "",
     brevoApiUrl: env.BREVO_API_URL || "https://api.brevo.com/v3/smtp/email",
+    brevoTimeoutMs: num(env.BREVO_TIMEOUT_MS, 15_000),
     brevoSenderEmail: env.BREVO_SENDER_EMAIL || "",
     brevoSmtpHost: env.BREVO_SMTP_HOST || "smtp-relay.brevo.com",
     brevoSmtpPort: num(env.BREVO_SMTP_PORT, 587),
@@ -101,6 +102,7 @@ export function loadConfig(overrides = {}) {
     silent: false,
     ...overrides,
   };
+  config.brevoApiKey = config.brevoApiKey.trim();
 
   if (!config.jwtSecret || config.jwtSecret.length < 32) {
     if (!config.allowInsecureDevSecret || config.isProd) {

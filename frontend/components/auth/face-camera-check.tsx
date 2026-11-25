@@ -138,13 +138,13 @@ export function FaceCameraCheck() {
             if (
               !response.ok ||
               !result.success ||
-              !["admin", "patient"].includes(result.role ?? "") ||
+              !["admin", "dentist", "patient"].includes(result.role ?? "") ||
               !["/admin", "/patient/book"].includes(result.redirectUrl ?? "")
             ) {
               stopCamera();
               setError(result.message ?? result.error?.message ?? "Face was not recognized.");
             } else {
-              const destination = result.role === "admin" ? "/admin" : "/patient/book";
+              const destination = result.role === "patient" ? "/patient/book" : "/admin";
               const user = await refreshSession();
               if (user.role !== result.role) {
                 throw new Error("The authenticated account role did not match the verification result.");

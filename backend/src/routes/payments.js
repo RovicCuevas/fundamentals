@@ -104,6 +104,16 @@ async function settlePaidDeposit(ctx, row, session) {
     throw new HttpError(409, "payment_amount_mismatch", "The PayMongo payment amount does not match the expected deposit.");
   }
 
+  const appointmentBefore = ctx.db.prepare(
+    "SELECT status FROM appointments WHERE id = ?",
+  ).get(row.appointment_id);
+  console.info("[payments] paid reconciliation entered", {
+    appointmentId: row.appointment_id,
+    appointmentStatusBefore: appointmentBefore?.status ?? null,
+    paymentStatusBefore: row.status,
+  });
+
+  let confirmed = false;
   tx(ctx.db, () => {
     ctx.db.prepare(
       `UPDATE appointment_payments
@@ -119,15 +129,20 @@ async function settlePaidDeposit(ctx, row, session) {
          amount_paid_centavos = excluded.amount_paid_centavos,
          status = 'paid'`,
     ).run(row.appointment_id, row.provider_checkout_id, providerPaymentId, row.amount_centavos);
-    ctx.db.prepare(
+    confirmed = ctx.db.prepare(
       `UPDATE appointments SET status = 'confirmed', updated_at = datetime('now')
        WHERE id = ? AND source = 'online_portal' AND status = 'pending'`,
-    ).run(row.appointment_id);
+    ).run(row.appointment_id).changes > 0;
   });
 
   const appointment = ctx.db.prepare(
     "SELECT id, reference, status, date, start_time, patient_id FROM appointments WHERE id = ?",
   ).get(row.appointment_id);
+  console.info("[payments] paid reconciliation completed", {
+    appointmentId: appointment.id,
+    appointmentStatusAfter: appointment.status,
+    triggersAppointmentConfirmed: confirmed,
+  });
   const patientUserId = ctx.db.prepare("SELECT user_id FROM patients WHERE id = ?").get(appointment.patient_id)?.user_id;
   const payload = {
     id: appointment.id,
@@ -139,16 +154,43 @@ async function settlePaidDeposit(ctx, row, session) {
   if (patientUserId) ctx.hub.toUser(patientUserId, "appointment.updated", payload);
   ctx.hub.toRoles(["admin", "clerk"], "appointment.updated", payload);
   if (patientUserId) {
-    await ctx.app.notifier.send({
-      userId: patientUserId,
-      appointmentId: appointment.id,
-      template: "payment_received",
-      data: appointment,
-    });
+    try {
+      await ctx.app.notifier.send({
+        userId: patientUserId,
+        appointmentId: appointment.id,
+        template: "payment_received",
+        data: appointment,
+      });
+    } catch (error) {
+      console.error("Could not send payment notification", {
+        appointmentId: appointment.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  if (confirmed && patientUserId) {
+    try {
+      await ctx.app.notifier.send({
+        userId: patientUserId,
+        appointmentId: appointment.id,
+        template: "appointment_confirmed",
+        data: appointment,
+      });
+    } catch (error) {
+      console.error("Could not send appointment confirmation notification", {
+        appointmentId: appointment.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 }
 
 async function syncPayment(ctx, row) {
+  console.info("[payments] sync reconciliation entered", {
+    appointmentId: row.appointment_id,
+    appointmentStatus: row.appointment_status,
+    paymentStatus: row.status,
+  });
   const transaction = ctx.db.prepare(
     `SELECT provider_payment_id, amount_paid_centavos FROM payment_transactions
      WHERE appointment_id = ? AND status = 'paid'`,

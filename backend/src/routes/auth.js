@@ -207,7 +207,7 @@ export default function register(router, app) {
   });
 
   router.post("/api/auth/face-enroll", requireAuth, (ctx) => {
-    if (!["patient", "admin"].includes(ctx.user.role)) {
+    if (!["patient", "dentist", "admin"].includes(ctx.user.role)) {
       throw unauthorized("This account cannot enroll for face login");
     }
     if (ctx.body?.consent !== true) {
@@ -221,11 +221,21 @@ export default function register(router, app) {
     }
 
     const encryptedDescriptor = encryptFaceDescriptor(ctx.body.descriptor, ctx.config.faceDescriptorKey);
-    ctx.db.prepare(
+    const updated = ctx.db.prepare(
       `UPDATE users SET face_descriptor = ?, face_descriptor_consent_at = datetime('now')
        WHERE id = ? AND active = 1`,
     )
       .run(encryptedDescriptor, ctx.user.id);
+    if (!updated?.changes) {
+      throw unauthorized("Could not enable face login for this account");
+    }
+    const persisted = ctx.db.prepare(
+      "SELECT face_descriptor FROM users WHERE id = ? AND active = 1",
+    ).get(ctx.user.id);
+    const decryptedPersisted = persisted ? decryptFaceDescriptor(persisted.face_descriptor, ctx.config.faceDescriptorKey) : null;
+    if (!decryptedPersisted || euclideanDistance(decryptedPersisted, ctx.body.descriptor) !== 0) {
+      throw new HttpError(500, "face_enrollment_persistence_failed", "Face login enrollment could not be persisted.");
+    }
     return { success: true };
   });
 
@@ -234,6 +244,19 @@ export default function register(router, app) {
       "UPDATE users SET face_descriptor = NULL, face_descriptor_consent_at = NULL WHERE id = ?",
     ).run(ctx.user.id);
     return { success: true };
+  });
+
+  router.get("/api/auth/face-enroll/status", requireAuth, (ctx) => {
+    const row = ctx.db.prepare(
+      "SELECT face_descriptor, face_descriptor_consent_at FROM users WHERE id = ? AND active = 1",
+    ).get(ctx.user.id);
+    const descriptor = row?.face_descriptor
+      ? decryptFaceDescriptor(row.face_descriptor, ctx.config.faceDescriptorKey)
+      : null;
+    return {
+      enrolled: Boolean(descriptor),
+      consentAt: row?.face_descriptor_consent_at ?? null,
+    };
   });
 
   router.post("/api/auth/face-login", (ctx) => {
@@ -252,10 +275,12 @@ export default function register(router, app) {
     const candidates = ctx.db.prepare(
       `SELECT id, role, email, full_name, face_descriptor
        FROM users
-       WHERE active = 1 AND role IN ('admin','patient') AND face_descriptor IS NOT NULL`,
+       WHERE active = 1 AND role IN ('admin','dentist','patient') AND face_descriptor IS NOT NULL`,
     ).all();
     let match = null;
-    let closestDistance = FACE_MATCH_THRESHOLD;
+    let closestDistance = Infinity;
+    let unreadableDescriptorCount = 0;
+    let decryptedDescriptorCount = 0;
 
     for (const candidate of candidates) {
       const storedDescriptor = decryptFaceDescriptor(
@@ -263,9 +288,10 @@ export default function register(router, app) {
         ctx.config.faceDescriptorKey,
       );
       if (!storedDescriptor) {
-        console.error(`Ignoring unreadable face descriptor for user ${candidate.id}`);
+        unreadableDescriptorCount += 1;
         continue;
       }
+      decryptedDescriptorCount += 1;
       const distance = euclideanDistance(ctx.body.descriptor, storedDescriptor);
       if (distance < closestDistance) {
         match = candidate;
@@ -273,13 +299,20 @@ export default function register(router, app) {
       }
     }
 
-    if (!match) {
+    if (!match || closestDistance >= FACE_MATCH_THRESHOLD) {
       recordFailure(ctx.db, key);
+      console.warn("[face-login:match-failed]", {
+        enrolledDescriptorCount: candidates.length,
+        decryptedDescriptorCount,
+        unreadableDescriptorCount,
+        bestDistance: Number.isFinite(closestDistance) ? Number(closestDistance.toFixed(4)) : null,
+        threshold: FACE_MATCH_THRESHOLD,
+      });
       throw unauthorized("Unrecognized Face");
     }
     clearCounter(ctx.db, key);
     const session = startSession(ctx, ctx.db.prepare("SELECT * FROM users WHERE id = ?").get(match.id));
-    const redirectUrl = match.role === "admin" ? "/admin" : "/patient/book";
+    const redirectUrl = match.role === "patient" ? "/patient/book" : "/admin";
     return {
       success: true,
       token: session.token,

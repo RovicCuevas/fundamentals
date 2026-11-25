@@ -29,15 +29,7 @@ export function createApp(overrides = {}) {
     ...configOverrides,
     ...(configOverrides.dbPath === ":memory:" ? { supabaseDbUrl: "" } : {}),
   });
-  let db;
-  try {
-    db = openDb(config.dbPath, config.supabaseDbUrl);
-  } catch (error) {
-    if (!config.supabaseDbUrl) throw error;
-    console.warn(`[database] Supabase unavailable (${error.code || error.name}: ${error.message}); falling back to SQLite at ${config.dbPath}`);
-    config.supabaseDbUrl = "";
-    db = openDb(config.dbPath);
-  }
+  const db = openDb(config.dbPath, config.supabaseDbUrl);
   const hub = new Hub();
   const router = new Router();
   const app = {
@@ -53,7 +45,22 @@ export function createApp(overrides = {}) {
   app.expireUnpaidPendingAppointments = () => expireUnpaidPendingAppointments(app);
   app.sendAppointmentReminders = () => sendAppointmentReminders(app);
 
-  router.get("/api/health", () => ({ status: "ok", time: config.clock().toISOString() }));
+  router.get("/api/health", () => ({
+    status: "ok",
+    time: config.clock().toISOString(),
+    identityProviders: {
+      ocrSpace: Boolean(config.ocrSpaceApiKey),
+      facePlusPlus: Boolean(config.facePlusPlusApiKey && config.facePlusPlusApiSecret),
+    },
+    notifications: {
+      provider: config.notificationProvider,
+      configured: config.notificationProvider === "brevo-api"
+        ? Boolean(config.brevoApiKey && config.notificationFromEmail)
+        : config.notificationProvider === "brevo-smtp"
+          ? Boolean(config.brevoSmtpUser && config.brevoSmtpPassword && config.notificationFromEmail)
+          : true,
+    },
+  }));
   for (const register of [authRoutes, catalogRoutes, dentistRoutes, patientRoutes, appointmentRoutes, messageRoutes, adminRoutes, paymentRoutes, identityVerificationRoutes]) {
     register(router, app);
   }

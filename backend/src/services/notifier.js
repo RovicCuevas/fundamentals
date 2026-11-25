@@ -45,10 +45,10 @@ function consoleProvider({ channel, recipient, subject }) {
   console.info("[notification]", { channel, recipient, subject });
 }
 
-async function brevoFailureMessage(response) {
+async function brevoFailureMessage(status, responseText) {
   let details = "";
   try {
-    const payload = await response.json();
+    const payload = responseText ? JSON.parse(responseText) : null;
     const code = typeof payload?.code === "string" ? payload.code : "";
     const message = typeof payload?.message === "string" ? payload.message : "";
     details = [code, message].filter(Boolean).join(": ");
@@ -56,23 +56,44 @@ async function brevoFailureMessage(response) {
     // Brevo may return an empty or non-JSON error body.
   }
   const safeDetails = details.replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 240);
-  return `Brevo API returned HTTP ${response.status}${safeDetails ? `: ${safeDetails}` : ""}`;
+  return `Brevo API returned HTTP ${status}${safeDetails ? `: ${safeDetails}` : ""}`;
 }
 
 function createBrevoApiProvider(config) {
   return async ({ recipient, subject, body }) => {
-    const response = await fetch(config.brevoApiUrl, {
-      method: "POST",
-      headers: { "accept": "application/json", "api-key": config.brevoApiKey, "content-type": "application/json" },
-      body: JSON.stringify({
-        sender: { email: config.notificationFromEmail, name: config.notificationFromName },
-        to: [{ email: recipient }],
-        subject,
-        textContent: body,
-      }),
-    });
-    if (!response.ok) {
-      throw new Error(await brevoFailureMessage(response));
+    const controller = new AbortController();
+    const timeoutMs = Number.isInteger(config.brevoTimeoutMs) && config.brevoTimeoutMs >= 1000
+      ? config.brevoTimeoutMs
+      : 15_000;
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(config.brevoApiUrl, {
+        method: "POST",
+        headers: { "accept": "application/json", "api-key": config.brevoApiKey, "content-type": "application/json" },
+        body: JSON.stringify({
+          sender: { email: config.notificationFromEmail, name: config.notificationFromName },
+          to: [{ email: recipient }],
+          subject,
+          textContent: body,
+        }),
+        signal: controller.signal,
+      });
+      const responseText = await response.text();
+      console.info("[brevo] response", {
+        status: response.status,
+        ok: response.ok,
+        body: responseText,
+      });
+      if (!response.ok) {
+        throw new Error(await brevoFailureMessage(response.status, responseText));
+      }
+    } catch (error) {
+      if (error?.name === "AbortError") {
+        throw new Error("Brevo API request timed out");
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
     }
   };
 }
@@ -96,6 +117,12 @@ function createBrevoSmtpProvider(config) {
 
 export function createNotifier({ db, config = {}, provider } = {}) {
   if (!db) throw new Error("Notifier requires a database");
+  console.info("[notifications] runtime", {
+    provider: config.notificationProvider ?? "console",
+    brevoApiUrl: config.brevoApiUrl ?? "",
+    notificationFromEmail: config.notificationFromEmail ?? "",
+    notificationFromName: config.notificationFromName ?? "",
+  });
   const sendProvider = provider ??
     (config.notificationProvider === "brevo-api" ? createBrevoApiProvider(config) :
       config.notificationProvider === "brevo-smtp" ? createBrevoSmtpProvider(config) : consoleProvider);
@@ -118,7 +145,8 @@ export function createNotifier({ db, config = {}, provider } = {}) {
            (appointment_id, user_id, channel, template, recipient, dedupe_key, status, created_at)
            VALUES (?, ?, ?, ?, ?, ?, 'failed', datetime('now'))`,
         ).run(appointmentId, userId, channel, template, address, key);
-        const detail = error instanceof Error && error.message.startsWith("Brevo API returned HTTP ")
+        const detail = error instanceof Error &&
+          (error.message.startsWith("Brevo API returned HTTP ") || error.message === "Brevo API request timed out")
           ? error.message
           : "provider error";
         throw new Error(`Notification delivery failed for ${template}: ${detail}`, { cause: error });

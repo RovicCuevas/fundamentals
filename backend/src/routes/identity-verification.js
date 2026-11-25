@@ -144,6 +144,9 @@ export default function register(router) {
 
   router.delete("/api/identity-verification", requireRole("dentist", "admin"), (ctx) => {
     ctx.db.prepare("DELETE FROM identity_verifications WHERE user_id = ?").run(ctx.user.id);
+    ctx.db.prepare(
+      "UPDATE users SET face_descriptor = NULL, face_descriptor_consent_at = NULL WHERE id = ?",
+    ).run(ctx.user.id);
     return { status: "not_started" };
   });
 

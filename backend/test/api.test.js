@@ -178,16 +178,22 @@ describe("auth & access control", () => {
     test("Brevo API provider sends the configured message without logging its body", async () => {
       const calls = [];
       const originalFetch = globalThis.fetch;
+      const originalInfo = console.info;
+      const infoCalls = [];
+      console.info = (...args) => infoCalls.push(args);
       globalThis.fetch = async (url, init) => {
         calls.push({ url, init });
-        return new Response("", { status: 201 });
+        return new Response(JSON.stringify({ messageId: "test-message-id" }), {
+          status: 201,
+          headers: { "content-type": "application/json" },
+        });
       };
       try {
         const config = loadConfig({
           jwtSecret: "t".repeat(40),
           faceDescriptorKey: "a".repeat(64),
           notificationProvider: "brevo-api",
-          brevoApiKey: "test-key",
+          brevoApiKey: "  test-key \t",
           notificationFromEmail: "sender@example.test",
           notificationFromName: "SmartCare Dental Clinic",
         });
@@ -203,8 +209,15 @@ describe("auth & access control", () => {
         assert.equal(calls[0].url, "https://api.brevo.com/v3/smtp/email");
         assert.equal(calls[0].init.headers["api-key"], "test-key");
         assert.equal(JSON.parse(calls[0].init.body).sender.email, "sender@example.test");
+        const brevoResponseLog = infoCalls.find(([label]) => label === "[brevo] response");
+        assert.deepEqual(brevoResponseLog?.[1], {
+          status: 201,
+          ok: true,
+          body: JSON.stringify({ messageId: "test-message-id" }),
+        });
       } finally {
         globalThis.fetch = originalFetch;
+        console.info = originalInfo;
       }
     });
 
@@ -236,6 +249,46 @@ describe("auth & access control", () => {
             assert.match(error.message, /Invalid API key/);
             assert.doesNotMatch(error.message, /secret-test-key/);
             assert.doesNotMatch(error.message, /SC-ERROR/);
+            return true;
+          },
+        );
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+
+    test("Brevo API times out safely without leaking request data", async () => {
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = async (_url, init) => {
+        await new Promise((resolve) => {
+          init.signal.addEventListener("abort", resolve, { once: true });
+        });
+        const abort = new Error("This operation was aborted");
+        abort.name = "AbortError";
+        throw abort;
+      };
+      try {
+        const config = loadConfig({
+          jwtSecret: "t".repeat(40),
+          faceDescriptorKey: "a".repeat(64),
+          notificationProvider: "brevo-api",
+          brevoApiKey: "secret-test-key",
+          notificationFromEmail: "sender@example.test",
+        });
+        config.brevoTimeoutMs = 10;
+        const notifier = createNotifier({ db: srv.app.db, config });
+        const user = srv.app.db.prepare("SELECT id FROM users WHERE email = ?").get("maria.santos@smartcare.test");
+        await assert.rejects(
+          () => notifier.send({
+            userId: user.id,
+            template: "appointment_rescheduled",
+            dedupeKey: "brevo-timeout-test",
+            data: { reference: "SC-TIMEOUT", date: "2026-12-01", startTime: "10:00" },
+          }),
+          (error) => {
+            assert.match(error.message, /timed out/i);
+            assert.doesNotMatch(error.message, /secret-test-key/);
+            assert.doesNotMatch(error.message, /SC-TIMEOUT/);
             return true;
           },
         );
@@ -1168,6 +1221,16 @@ describe("booking flow", { concurrency: false }, () => {
     assert.equal(transaction.status, "paid");
     srv.app.db.prepare("UPDATE appointment_payments SET status = 'pending' WHERE appointment_id = ?").run(apptId);
     srv.app.db.prepare("UPDATE appointments SET status = 'pending' WHERE id = ?").run(apptId);
+    const reconciledByPaymentSync = await api("GET", `/api/payments/${apptId}`, { token: maria });
+    assert.equal(reconciledByPaymentSync.status, 200);
+    assert.equal(reconciledByPaymentSync.body.bookingStatus, "confirmed");
+    const paidSyncNotifications = srv.app.db.prepare(
+      "SELECT template FROM notification_log WHERE appointment_id = ? AND status = 'sent'",
+    ).all(apptId);
+    assert.ok(
+      paidSyncNotifications.some(({ template }) => template === "appointment_confirmed"),
+      "a payment reconciliation that confirms an appointment must send the confirmation email",
+    );
     const reconciledFromTransaction = await api("PATCH", `/api/appointments/${apptId}/status`, {
       token: dentist,
       body: { status: "confirmed" },

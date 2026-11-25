@@ -15,12 +15,24 @@ function safeProviderDetail(value) {
     .slice(0, 240);
 }
 
+function fileMetadata(contentType) {
+  if (contentType === "image/jpeg") return { filetype: "JPG", filename: "id-upload.jpg" };
+  if (contentType === "image/png") return { filetype: "PNG", filename: "id-upload.png" };
+  if (contentType === "image/webp") return { filetype: "WEBP", filename: "id-upload.webp" };
+  return null;
+}
+
 export async function ocrIdImage(config, image) {
   providerConfig(config);
+  const metadata = fileMetadata(image.contentType);
+  if (!metadata) {
+    throw new HttpError(422, "identity_image_invalid", "The government ID must be a JPEG, PNG, or WebP image.");
+  }
   const form = new FormData();
   form.append("language", config.ocrSpaceLanguage);
   form.append("isOverlayRequired", "false");
-  form.append("file", new Blob([image.data], { type: image.contentType }), "identity-document");
+  form.append("filetype", metadata.filetype);
+  form.append("file", new Blob([image.data], { type: image.contentType }), metadata.filename);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), config.ocrSpaceTimeoutMs);
 

@@ -2,6 +2,7 @@ import { after, before, describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { createApp } from "../src/app.js";
 import { signToken } from "../src/lib/security.js";
+import { decryptFaceDescriptor, euclideanDistance } from "../src/lib/face-descriptors.js";
 
 let srv;
 let base;
@@ -48,9 +49,57 @@ after(async () => {
 });
 
 describe("identity verification", () => {
+  test("health reports identity provider readiness without exposing credentials", async () => {
+    const response = await api("GET", "/api/health");
+    assert.equal(response.status, 200);
+    assert.equal(response.body.identityProviders.ocrSpace, true);
+    assert.equal(response.body.identityProviders.facePlusPlus, true);
+    assert.doesNotMatch(JSON.stringify(response.body), /ocr-test-key|test-secret|test-key/);
+  });
+
   test("requires a dentist or admin session", async () => {
     assert.equal((await api("GET", "/api/identity-verification")).status, 401);
     assert.equal((await api("GET", "/api/identity-verification", { token: srv.patientToken })).status, 403);
+  });
+
+  test("face login reports zero enrolled descriptors without leaking vectors", async () => {
+    srv.app.db.prepare("UPDATE users SET face_descriptor = NULL, face_descriptor_consent_at = NULL").run();
+    const originalWarn = console.warn;
+    const logs = [];
+    console.warn = (...args) => logs.push(args);
+    try {
+      const descriptor = Array.from({ length: 128 }, () => 0.1);
+      const login = await api("POST", "/api/auth/face-login", { body: { descriptor } });
+      assert.equal(login.status, 401);
+      assert.ok(logs.some((args) =>
+        args[0] === "[face-login:match-failed]" &&
+        args[1]?.enrolledDescriptorCount === 0
+      ));
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+
+  test("a dentist identity can enroll and then log in by face", async () => {
+    const descriptor = Array.from({ length: 128 }, (_, index) => index % 2 === 0 ? -0.12 : 0.12);
+    const enroll = await api("POST", "/api/auth/face-enroll", {
+      token: srv.dentistToken,
+      body: { descriptor, consent: true },
+    });
+    assert.equal(enroll.status, 200);
+    const status = await api("GET", "/api/auth/face-enroll/status", { token: srv.dentistToken });
+    assert.equal(status.status, 200);
+    assert.equal(status.body.enrolled, true);
+    assert.ok(status.body.consentAt);
+    const stored = srv.app.db.prepare("SELECT face_descriptor FROM users WHERE id = ?").get(srv.dentistId);
+    const decrypted = decryptFaceDescriptor(stored.face_descriptor, srv.app.config.faceDescriptorKey);
+    assert.ok(decrypted);
+    assert.equal(euclideanDistance(decrypted, descriptor), 0);
+    const login = await api("POST", "/api/auth/face-login", {
+      body: { descriptor },
+    });
+    assert.equal(login.status, 200);
+    assert.equal(login.body.role, "dentist");
   });
 
   test("validates consent and image content before calling Face++", async () => {
@@ -66,6 +115,61 @@ describe("identity verification", () => {
     });
     assert.equal(response.status, 422);
     assert.equal(calls, 0);
+  });
+
+  test("sends Face++ extension-matched filenames for valid image types", async () => {
+    globalThis.fetch = async (url, init) => {
+      if (String(url).startsWith("https://api.ocr.space")) {
+        return new Response(JSON.stringify({
+          IsErroredOnProcessing: false,
+          ParsedResults: [{ ParsedText: "Full Name: Face Upload Test" }],
+        }), { status: 200 });
+      }
+      if (String(url).startsWith("https://api-us.faceplusplus.com")) {
+        const form = init.body;
+        assert.ok(form instanceof FormData);
+        const first = form.get("image_file1");
+        const second = form.get("image_file2");
+        assert.equal(first.type, "image/png");
+        assert.equal(second.type, "image/png");
+        assert.equal(first.name, "image_file1.png");
+        assert.equal(second.name, "image_file2.png");
+        return new Response(JSON.stringify({ request_id: "face-format-test", confidence: 92 }), { status: 200 });
+      }
+      return nativeFetch(url, init);
+    };
+    const response = await api("POST", "/api/identity-verification", {
+      token: srv.dentistToken,
+      body: { idImageBase64: imageBase64, selfieImageBase64: imageBase64, consent: true },
+    });
+    assert.equal(response.status, 200);
+  });
+
+  test("sends OCR.space an explicit filetype and extension-matched filename", async () => {
+    globalThis.fetch = async (url, init) => {
+      if (!String(url).startsWith("https://api.ocr.space") && !String(url).startsWith("https://api-us.faceplusplus.com")) {
+        return nativeFetch(url, init);
+      }
+      if (String(url).startsWith("https://api-us.faceplusplus.com")) {
+        return new Response(JSON.stringify({ request_id: "ocr-format-test", confidence: 92 }), { status: 200 });
+      }
+      const form = init.body;
+      assert.ok(form instanceof FormData);
+      assert.equal(form.get("filetype"), "PNG");
+      const file = form.get("file");
+      assert.ok(file instanceof Blob);
+      assert.equal(file.type, "image/png");
+      assert.equal(file.name, "id-upload.png");
+      return new Response(JSON.stringify({
+        IsErroredOnProcessing: false,
+        ParsedResults: [{ ParsedText: "Full Name: OCR Upload Test" }],
+      }), { status: 200 });
+    };
+    const response = await api("POST", "/api/identity-verification", {
+      token: srv.dentistToken,
+      body: { idImageBase64: imageBase64, selfieImageBase64: imageBase64, consent: true },
+    });
+    assert.equal(response.status, 200);
   });
 
   test("stores only the selected OCR fields and face score", async () => {
